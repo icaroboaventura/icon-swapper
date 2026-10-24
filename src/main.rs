@@ -182,7 +182,6 @@ impl eframe::App for IconSwapper {
         }
 
         egui::TopBottomPanel::top("header").show(ctx, |ui| {
-            ui.heading("Application Icon Swapper");
             ui.label("Pick an application, then choose a new image to use as its icon.");
             ui.separator();
         });
