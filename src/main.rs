@@ -18,12 +18,23 @@ struct DesktopEntry {
     system_wide: bool,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DialogTarget {
+    AppIcon,
+    TrashEmpty,
+    TrashFull,
+}
+
 struct IconSwapper {
     entries: Vec<DesktopEntry>,
     selected: Option<usize>,
     search: String,
     file_dialog: FileDialog,
+    pending_target: Option<DialogTarget>,
     pending_image: Option<PathBuf>,
+    trash_empty_image: Option<PathBuf>,
+    trash_full_image: Option<PathBuf>,
+    show_system_icons: bool,
     status: String,
     textures: HashMap<String, egui::TextureHandle>,
 }
@@ -46,7 +57,11 @@ impl IconSwapper {
                     }),
                 )
                 .default_file_filter("Images"),
+            pending_target: None,
             pending_image: None,
+            trash_empty_image: None,
+            trash_full_image: None,
+            show_system_icons: false,
             status: String::new(),
             textures: HashMap::new(),
         }
@@ -173,112 +188,262 @@ fn install_app_icon(app_id: &str, icon_name: &str, image_path: &Path) -> Result<
     last_target.context("no icon size was generated")
 }
 
+fn current_icon_theme() -> String {
+    let output = std::process::Command::new("gsettings")
+        .args(["get", "org.gnome.desktop.interface", "icon-theme"])
+        .output();
+
+    match output {
+        Ok(out) if out.status.success() => {
+            let s = String::from_utf8_lossy(&out.stdout);
+            s.trim().trim_matches('\'').trim_matches('"').to_string()
+        }
+        _ => "hicolor".to_string(),
+    }
+}
+
+fn install_trash_icons(empty_path: &Path, full_path: &Path) -> Result<()> {
+    let data_dir = dirs::data_dir().context("could not find user data directory")?;
+    let theme_name = "icon-swapper";
+    let theme_dir = data_dir.join("icons").join(theme_name);
+
+    // Remove old trash icons in our override theme.
+    let _ = std::fs::remove_dir_all(&theme_dir);
+
+    let sizes = [16, 24, 32, 48, 64, 128, 256];
+    let mut dir_lines = Vec::new();
+    for size in sizes {
+        let dir = theme_dir.join(format!("{size}x{size}/places"));
+        std::fs::create_dir_all(&dir)?;
+
+        let empty_img = image::open(empty_path)
+            .with_context(|| format!("failed to open empty trash image {}", empty_path.display()))?;
+        let full_img = image::open(full_path)
+            .with_context(|| format!("failed to open full trash image {}", full_path.display()))?;
+
+        empty_img
+            .resize(size, size, image::imageops::FilterType::Lanczos3)
+            .save(dir.join("user-trash.png"))?;
+        full_img
+            .resize(size, size, image::imageops::FilterType::Lanczos3)
+            .save(dir.join("user-trash-full.png"))?;
+
+        dir_lines.push(format!(
+            "[{size}x{size}/places]\nSize={size}\nType=Fixed\nContext=Places\n"
+        ));
+    }
+
+    let parent_theme = current_icon_theme();
+    let index = format!(
+        "[Icon Theme]\nName={theme_name}\nComment=Icon Swapper overrides\nInherits={parent_theme}\nDirectories={}\n\n{}",
+        sizes.iter().map(|s| format!("{s}x{s}/places")).collect::<Vec<_>>().join(","),
+        dir_lines.join("\n")
+    );
+    std::fs::write(theme_dir.join("index.theme"), index)?;
+
+    let _ = std::process::Command::new("gtk-update-icon-cache")
+        .arg("-f")
+        .arg("-t")
+        .arg(&theme_dir)
+        .status();
+
+    let _ = std::process::Command::new("gsettings")
+        .args(["set", "org.gnome.desktop.interface", "icon-theme", theme_name])
+        .status();
+
+    Ok(())
+}
+
 impl eframe::App for IconSwapper {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.file_dialog.update(ctx);
 
         if let Some(path) = self.file_dialog.take_selected() {
-            self.pending_image = Some(path);
+            match self.pending_target {
+                Some(DialogTarget::AppIcon) => self.pending_image = Some(path),
+                Some(DialogTarget::TrashEmpty) => self.trash_empty_image = Some(path),
+                Some(DialogTarget::TrashFull) => self.trash_full_image = Some(path),
+                None => {}
+            }
+            self.pending_target = None;
         }
 
         egui::TopBottomPanel::top("header").show(ctx, |ui| {
-            ui.label("Pick an application, then choose a new image to use as its icon.");
+            ui.horizontal(|ui| {
+                if ui
+                    .selectable_label(!self.show_system_icons, "Applications")
+                    .clicked()
+                {
+                    self.show_system_icons = false;
+                    self.status.clear();
+                }
+                if ui
+                    .selectable_label(self.show_system_icons, "System Icons")
+                    .clicked()
+                {
+                    self.show_system_icons = true;
+                    self.status.clear();
+                }
+            });
             ui.separator();
         });
 
-        egui::SidePanel::left("app_list")
-            .resizable(true)
-            .min_width(280.0)
-            .show(ctx, |ui| {
-                ui.label("Applications");
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.search)
-                        .hint_text("Search apps…")
-                        .desired_width(f32::INFINITY),
-                );
+        if self.show_system_icons {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.heading("Trash");
+                ui.label("Choose images for empty and full trash states.");
+                ui.separator();
 
-                let query = self.search.to_lowercase();
-                egui::ScrollArea::vertical()
-                    .auto_shrink([false; 2])
-                    .show(ui, |ui| {
-                        let mut matched = false;
-                        for (idx, entry) in self.entries.iter().enumerate() {
-                            if !query.is_empty()
-                                && !entry.name.to_lowercase().contains(&query)
-                            {
-                                continue;
-                            }
-                            matched = true;
-                            let selected = self.selected == Some(idx);
-                            let label = if entry.system_wide {
-                                format!("{} (system)", entry.name)
-                            } else {
-                                entry.name.clone()
-                            };
-                            let response = ui.selectable_label(selected, label);
-                            if response.clicked() {
-                                self.selected = Some(idx);
-                                self.status.clear();
-                            }
+                ui.horizontal(|ui| {
+                    ui.vertical(|ui| {
+                        ui.label("Empty trash");
+                        if let Some(path) = &self.trash_empty_image {
+                            ui.label(path.display().to_string());
+                        } else {
+                            ui.label("(no image selected)");
                         }
-                        if !matched && !query.is_empty() {
-                            ui.label("No applications match your search.");
+                        if ui.button("Choose image…").clicked() {
+                            self.pending_target = Some(DialogTarget::TrashEmpty);
+                            self.file_dialog.select_file();
                         }
                     });
-            });
 
-        egui::CentralPanel::default().show(ctx, |ui| {
-            if let Some(idx) = self.selected {
-                let entry = self.entries[idx].clone();
-                self.ensure_preview(ctx, &entry);
-
-                ui.label(format!("Name: {}", entry.name));
-                ui.label(format!("Command: {}", entry.exec));
-                ui.label(format!("Desktop file: {}", entry.path.display()));
-                if entry.system_wide {
-                    ui.colored_label(egui::Color32::from_rgb(200, 120, 0), "System app — a user override will be created");
-                }
-                ui.label(format!("Current icon: {}", entry.icon));
-
-                if let Some(tex) = self.textures.get(&entry.path.to_string_lossy().to_string()) {
-                    ui.image(tex);
-                } else {
-                    ui.label("(no preview available)");
-                }
+                    ui.vertical(|ui| {
+                        ui.label("Full trash");
+                        if let Some(path) = &self.trash_full_image {
+                            ui.label(path.display().to_string());
+                        } else {
+                            ui.label("(no image selected)");
+                        }
+                        if ui.button("Choose image…").clicked() {
+                            self.pending_target = Some(DialogTarget::TrashFull);
+                            self.file_dialog.select_file();
+                        }
+                    });
+                });
 
                 ui.separator();
 
-                if ui.button("Choose new image…").clicked() {
-                    self.file_dialog.select_file();
-                }
-
-                if let Some(pending) = self.pending_image.clone() {
-                    ui.label(format!("Selected image: {}", pending.display()));
-                    if ui.button("Apply new icon").clicked() {
-                        match self.apply_new_icon(&entry, &pending) {
-                            Ok(target_path) => {
-                                self.status = format!("Icon updated for {}", entry.name);
-                                self.pending_image = None;
-                                // Refresh entry and texture
-                                if let Some(updated) = load_single_entry(&target_path, false) {
-                                    self.entries[idx] = updated.clone();
-                                    self.textures.remove(&entry.path.to_string_lossy().to_string());
-                                    self.ensure_preview(ctx, &updated);
-                                }
-                            }
-                            Err(e) => self.status = format!("Error: {e:#}"),
+                if ui
+                    .add_enabled(
+                        self.trash_empty_image.is_some() && self.trash_full_image.is_some(),
+                        egui::Button::new("Apply trash icons"),
+                    )
+                    .clicked()
+                {
+                    let empty = self.trash_empty_image.clone().unwrap();
+                    let full = self.trash_full_image.clone().unwrap();
+                    match install_trash_icons(&empty, &full) {
+                        Ok(()) => {
+                            self.status = "Trash icons updated. You may need to restart GNOME Shell.".to_string();
+                            self.trash_empty_image = None;
+                            self.trash_full_image = None;
                         }
+                        Err(e) => self.status = format!("Error: {e:#}"),
                     }
                 }
-            } else {
-                ui.label("Select an application from the list.");
-            }
 
-            if !self.status.is_empty() {
-                ui.separator();
-                ui.colored_label(egui::Color32::from_rgb(0, 128, 0), &self.status);
-            }
-        });
+                if !self.status.is_empty() {
+                    ui.separator();
+                    ui.colored_label(egui::Color32::from_rgb(0, 128, 0), &self.status);
+                }
+            });
+        } else {
+            egui::SidePanel::left("app_list")
+                .resizable(true)
+                .min_width(280.0)
+                .show(ctx, |ui| {
+                    ui.label("Applications");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.search)
+                            .hint_text("Search apps…")
+                            .desired_width(f32::INFINITY),
+                    );
+
+                    let query = self.search.to_lowercase();
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false; 2])
+                        .show(ui, |ui| {
+                            let mut matched = false;
+                            for (idx, entry) in self.entries.iter().enumerate() {
+                                if !query.is_empty()
+                                    && !entry.name.to_lowercase().contains(&query)
+                                {
+                                    continue;
+                                }
+                                matched = true;
+                                let selected = self.selected == Some(idx);
+                                let label = if entry.system_wide {
+                                    format!("{} (system)", entry.name)
+                                } else {
+                                    entry.name.clone()
+                                };
+                                let response = ui.selectable_label(selected, label);
+                                if response.clicked() {
+                                    self.selected = Some(idx);
+                                    self.status.clear();
+                                }
+                            }
+                            if !matched && !query.is_empty() {
+                                ui.label("No applications match your search.");
+                            }
+                        });
+                });
+
+            egui::CentralPanel::default().show(ctx, |ui| {
+                if let Some(idx) = self.selected {
+                    let entry = self.entries[idx].clone();
+                    self.ensure_preview(ctx, &entry);
+
+                    ui.label(format!("Name: {}", entry.name));
+                    ui.label(format!("Command: {}", entry.exec));
+                    ui.label(format!("Desktop file: {}", entry.path.display()));
+                    if entry.system_wide {
+                        ui.colored_label(egui::Color32::from_rgb(200, 120, 0), "System app — a user override will be created");
+                    }
+                    ui.label(format!("Current icon: {}", entry.icon));
+
+                    if let Some(tex) = self.textures.get(&entry.path.to_string_lossy().to_string()) {
+                        ui.image(tex);
+                    } else {
+                        ui.label("(no preview available)");
+                    }
+
+                    ui.separator();
+
+                    if ui.button("Choose new image…").clicked() {
+                        self.pending_target = Some(DialogTarget::AppIcon);
+                        self.file_dialog.select_file();
+                    }
+
+                    if let Some(pending) = self.pending_image.clone() {
+                        ui.label(format!("Selected image: {}", pending.display()));
+                        if ui.button("Apply new icon").clicked() {
+                            match self.apply_new_icon(&entry, &pending) {
+                                Ok(target_path) => {
+                                    self.status = format!("Icon updated for {}", entry.name);
+                                    self.pending_image = None;
+                                    // Refresh entry and texture
+                                    if let Some(updated) = load_single_entry(&target_path, false) {
+                                        self.entries[idx] = updated.clone();
+                                        self.textures.remove(&entry.path.to_string_lossy().to_string());
+                                        self.ensure_preview(ctx, &updated);
+                                    }
+                                }
+                                Err(e) => self.status = format!("Error: {e:#}"),
+                            }
+                        }
+                    }
+                } else {
+                    ui.label("Select an application from the list.");
+                }
+
+                if !self.status.is_empty() {
+                    ui.separator();
+                    ui.colored_label(egui::Color32::from_rgb(0, 128, 0), &self.status);
+                }
+            });
+        }
     }
 }
 
